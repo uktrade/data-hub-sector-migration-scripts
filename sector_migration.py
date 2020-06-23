@@ -1,4 +1,5 @@
 import copy
+import uuid
 
 import click
 import numpy as np, pandas as pd
@@ -21,29 +22,31 @@ def create_migration_object(old_sector, new_sector):
         'new_sector': sector2
     }
 
-def create_parents(sector_path, new_sectors_ids, new_sectors_cluster_ids):
+def create_parents(
+        sector_path,
+        new_sectors_ids,
+        new_sectors_cluster_ids,
+        generate_ids
+):
     parents = sector_path.split(' : ')[:-1]
     for i, parent in enumerate(parents):
         parent_path = ' : '.join(parents[:i+1])
         if not sector_exists(parent_path):
-            print('create_sector:', parent_path)
-            id = (
-                new_sectors_ids[parent_path]
-                if parent_path in new_sectors_ids
-                else None
-            )
-            sector_cluster_id = (
-                new_sectors_cluster_ids[parent_path]
-                if parent_path in new_sectors_cluster_ids
-                else None
-            )
+            id = new_sectors_ids.get(parent_path)
+            sector_cluster_id = new_sectors_cluster_ids.get(parent_path)
             create_sector(
                 parent_path,
                 id=id,
-                sector_cluster_id=sector_cluster_id
+                sector_cluster_id=sector_cluster_id,
+                generate_id=generate_ids
             )
 
-def create_sector(sector_path, id=None, sector_cluster_id=None):
+def create_sector(
+        sector_path,
+        id=None,
+        sector_cluster_id=None,
+        generate_id=False
+):
     if not sector_exists(sector_path):
         print('create_sector:', sector_path)
         sectors = state['sectors']
@@ -56,9 +59,15 @@ def create_sector(sector_path, id=None, sector_cluster_id=None):
         parent_id = parent['id'] if parent is not None else None
 
         if id is None:
-            raise Exception('test')
-            while id is None or len([s for s in sectors if s['id'] == id]) > 0:
-                id = uuid.uuid4()
+            if generate_id is True:
+                sector_id_exists = True
+                while id is None or sector_id_exists:
+                    id = uuid.uuid4()
+                    sector_id_exists = len(
+                        [s for s in sectors if s['id'] == id]
+                    ) > 0
+            else:
+                raise Exception(f'id not specified: {sector_path}')
 
         if sector_cluster_id is None:
             sector_cluster_id = parent['sector_cluster_id'] if parent else None
@@ -81,10 +90,8 @@ def delete_sector(sector_path):
     sector = [s for s in sectors if s['path'] == sector_path][0]
     sector['to_delete'] = True
     sectors_to_delete.append(sector)
-    # sectors_to_delete.append((sector['id'], sector_path))
 
 def generate_sectors_to_create_csvs(sectors):
-    # columns=['id', 'segment', 'sector_cluster_id', 'parent_id', 'path']
     fields = ['id', 'segment', 'sector_cluster_id', 'parent_id', 'path']
     data = []
     for sector in sectors:
@@ -94,6 +101,7 @@ def generate_sectors_to_create_csvs(sectors):
     
     df = df.sort_values('path', ascending=False)
     df.to_csv('sectors_to_create_reversed.csv', index=False)
+    return df
 
 def generate_sectors_to_rename_or_adopt(sectors):
     fields_base = [
@@ -121,6 +129,7 @@ def generate_sectors_to_rename_or_adopt(sectors):
     df.columns = fields_swap
     df = df[fields]
     df.to_csv('sectors_to_rename_or_adopt_reversed.csv', index=False)
+    return df
 
 def generate_sectors_to_migrate(sectors):
     fields_base = ['path', 'id']
@@ -142,6 +151,7 @@ def generate_sectors_to_migrate(sectors):
     df.columns = fields_swap
     df = df[fields]
     df.to_csv('sectors_to_migrate_reversed.csv', index=False)
+    return df
 
 def generate_sectors_to_delete(sectors):
     fields = ['id', 'path', 'parent_id', 'sector_cluster_id']
@@ -153,6 +163,7 @@ def generate_sectors_to_delete(sectors):
 
     df = df.sort_values('path', ascending=False)
     df.to_csv('sectors_to_delete_reversed.csv', index=False)
+    return df
     
 def get_sector(sector_path):
     sectors = state['sectors']
@@ -290,10 +301,8 @@ def update_sector_path(old_path, new_path):
         if s['path'].startswith(old_path):
             s['path'] = new_path + s['path'][len(old_path):]
     
-    id = sector['id']
     old_name = sector['segment']
     new_name = new_path.split(' : ')[-1]
-    sector_cluster_id = sector['sector_cluster_id']
     
     old_parents_path = ' : '.join(old_path.split(' : ')[:-1])
     new_parents_path = ' : '.join(new_path.split(' : ')[:-1])
@@ -309,10 +318,11 @@ def update_sector_path(old_path, new_path):
             new_parent = None
         else:
             new_parent = get_sector(new_parents_path)
-            
+
         if new_parent is not None:
             new_parent_id = new_parent['id']
             sector_cluster_id = new_parent['sector_cluster_id']
+            sector['sector_cluster_id'] = sector_cluster_id
         else:
             new_parent_id = None
             
@@ -341,14 +351,20 @@ def update_sector_path(old_path, new_path):
     '--create-sector-ids-filepath',
     default='create_sector_ids.csv'
 )
+@click.option(
+    '--generate-ids/--no--generate-ids',
+    default=False,
+    help='automatically generate new uuids for new sectors, ' \
+    'else, a list of ids is required through the ' \
+    '--create-sector-ids-filepath argument '
+)
 def main(
         sector_mappings_filepath,
         final_sector_list_filepath,
         existing_dh_sectors_filepath,
-        create_sector_ids_filepath
+        create_sector_ids_filepath,
+        generate_ids
 ):
-    print('main')
-
     global state
     
     df_sector_mappings = load_df_sector_mappings(sector_mappings_filepath)
@@ -358,10 +374,15 @@ def main(
     )
 
     # fixed new sector ids
-    df_create_sector_ids = load_df_create_sector_ids(create_sector_ids_filepath)
     new_sectors_ids = {}
-    for s in df_create_sector_ids.to_dict(orient='records'):
-        new_sectors_ids[s['path']] =  s['id']
+    if generate_ids is True:
+        df_create_sector_ids = pd.DataFrame()
+    else:
+        df_create_sector_ids = load_df_create_sector_ids(
+            create_sector_ids_filepath
+        )
+        for s in df_create_sector_ids.to_dict(orient='records'):
+            new_sectors_ids[s['path']] =  s['id']
     
     new_sectors_cluster_ids = {
         'Space': '531d3510-3f42-41fd-86b5-fa686fdfe33f'
@@ -408,27 +429,28 @@ def main(
             create_parents(
                 new_sector_path,
                 new_sectors_ids,
-                new_sectors_cluster_ids
+                new_sectors_cluster_ids,
+                generate_ids
             )
             update_sector_path(old_sector_path, new_sector_path)
             continue
-
+    print()
+        
     # create other new sectors
     for index, row in df_final_sector_list.iterrows():
         path = row['sector']
         if not sector_exists(path):
             id = new_sectors_ids.get(path)
             sector_cluster_id = new_sectors_cluster_ids.get(path)
-            create_sector(path, id=id, sector_cluster_id=sector_cluster_id)
-
-    # generate_sectors_to_create_csv
-    generate_sectors_to_create_csvs(state['sectors_to_create'])
-    generate_sectors_to_rename_or_adopt(state['sectors_to_rename_or_adopt'])
-    generate_sectors_to_migrate(state['sectors_to_migrate'])
-    generate_sectors_to_delete(state['sectors_to_delete'])
+            create_sector(
+                path,
+                id=id,
+                sector_cluster_id=sector_cluster_id,
+                generate_id=generate_ids
+            )
 
     # check deletions
-    print('\nCheck deletions')
+    print('\nCheck deletions: ', end='')
     for s in state['sectors_to_delete']:
         sector_id = s['id']
         children = [c for c in state['sectors'] if c['parent_id'] == sector_id]
@@ -443,6 +465,7 @@ def main(
     df_state = df_state[df_state['to_delete'].isna()]
 
     # check: sectors that are not in final_sector_list but are in sector state
+    print('Check final sector state: ', end='')
     df1 = pd.merge(
         df_state,
         df_final_sector_list,
@@ -467,6 +490,21 @@ def main(
     df = df[~df['path'].isin(exceptions)]
     assert len(df) == 0, f'Mismatch between sector state and ' \
         f'final_sector_list\n{df}'
+
+    print('OK')
+
+    # generate_sectors_to_create_csv
+    df_sectors_to_create = generate_sectors_to_create_csvs(
+        state['sectors_to_create']
+    )
+    generate_sectors_to_rename_or_adopt(state['sectors_to_rename_or_adopt'])
+    generate_sectors_to_migrate(state['sectors_to_migrate'])
+    generate_sectors_to_delete(state['sectors_to_delete'])
+
+    if generate_ids is True:
+        print('create create_sector_ids.csv')
+        df_sectors_to_create.to_csv('create_sector_ids.csv')
+        
 
 state = {}
     
